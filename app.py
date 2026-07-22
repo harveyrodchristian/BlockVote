@@ -12,7 +12,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "blockvote-secret-key-1999")
 
 # Configuration Constants
 NETWORK = Network.TESTNET
-BLOCKFROST_API_KEY = os.environ.get("BLOCKFROST_API_KEY", "YOUR_BLOCKFROST_PREPROD_KEY")
+BLOCKFROST_API_KEY = os.environ.get("BLOCKFROST_API_KEY", "preprodIjlbf4FjmgjyIdeOQ6oz1LIT3jAWpgG9")
 METADATA_LABEL = 1999
 
 # Cryptographic Keys Loading / Generation
@@ -48,6 +48,23 @@ else:
     context = None
     print("WARNING: BLOCKFROST_API_KEY is not configured. Running in Read-Only Demo mode.")
 
+def to_dict(obj):
+    if isinstance(obj, list):
+        return [to_dict(x) for x in obj]
+    elif hasattr(obj, '__dict__') or type(obj).__name__ == 'Namespace':
+        try:
+            d = vars(obj)
+        except TypeError:
+            try:
+                d = obj.__dict__
+            except AttributeError:
+                return str(obj)
+        return {k: to_dict(v) for k, v in d.items()}
+    elif isinstance(obj, dict):
+        return {k: to_dict(v) for k, v in obj.items()}
+    else:
+        return obj
+
 @app.route('/')
 def home():
     tally = {"Candidate A": 0, "Candidate B": 0}
@@ -57,9 +74,9 @@ def home():
     if has_api_key:
         try:
             # Fetch live records directly from Cardano's public ledger state
-            on_chain_records = api.metadata_label_jsons(label=METADATA_LABEL)
+            on_chain_records = api.metadata_label_json(label=str(METADATA_LABEL))
             for record in on_chain_records:
-                vote_data = record.json_metadata
+                vote_data = to_dict(record.json_metadata)
                 if isinstance(vote_data, dict):
                     candidate = vote_data.get("candidate")
                     if candidate in tally:
@@ -99,7 +116,7 @@ def vote():
             
             # Attach vote payload as Cardano Transaction Metadata
             metadata = Metadata({METADATA_LABEL: {"candidate": candidate, "app": "BlockVote"}})
-            builder.auxiliary_data = AuxiliaryData(metadata=metadata)
+            builder.auxiliary_data = AuxiliaryData(data=metadata)
             
             # Sign and build transaction
             signed_tx = builder.build_and_sign([payment_skey], change_address=my_address)
