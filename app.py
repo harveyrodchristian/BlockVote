@@ -77,6 +77,10 @@ def to_dict(obj):
     else:
         return obj
 
+@app.route('/health')
+def health():
+    return {"status": "healthy"}, 200
+
 @app.route('/')
 def home():
     tally = {"Candidate A": 0, "Candidate B": 0}
