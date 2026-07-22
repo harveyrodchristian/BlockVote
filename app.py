@@ -19,7 +19,19 @@ METADATA_LABEL = 1999
 KEY_FILE = "payment.skey"
 VKEY_FILE = "payment.vkey"
 
-if not os.path.exists(KEY_FILE):
+# Production configuration: load signing key from environment variables if present
+env_skey_json = os.environ.get("PAYMENT_SKEY_JSON")
+env_skey_cbor = os.environ.get("PAYMENT_SKEY_CBOR_HEX")
+
+if env_skey_json:
+    print("Loading admin signing key from environment variable (JSON)...")
+    payment_skey = PaymentSigningKey.from_json(env_skey_json)
+    payment_vkey = PaymentVerificationKey.from_signing_key(payment_skey)
+elif env_skey_cbor:
+    print("Loading admin signing key from environment variable (CBOR HEX)...")
+    payment_skey = PaymentSigningKey.from_cbor(bytes.fromhex(env_skey_cbor))
+    payment_vkey = PaymentVerificationKey.from_signing_key(payment_skey)
+elif not os.path.exists(KEY_FILE):
     print("Generating new admin cryptographic keys...")
     payment_skey = PaymentSigningKey.generate()
     payment_skey.save(KEY_FILE)
