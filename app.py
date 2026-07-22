@@ -1,87 +1,121 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify
-import hashlib
-import json
-import time
+import os
+from flask import Flask, render_template, request, redirect, url_for, flash
+from blockfrost import BlockFrostApi, ApiUrls
+from pycardano import (
+    BlockFrostChainContext, Network, PaymentSigningKey,
+    PaymentVerificationKey, Address, TransactionBuilder,
+    TransactionOutput, AuxiliaryData, Metadata
+)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "blockvote-secret-key-1999")
 
-# --- BLOCKCHAIN CORE ---
-class Block:
-    def __init__(self, index, timestamp, data, previous_hash):
-        self.index = index
-        self.timestamp = timestamp
-        self.data = data
-        self.previous_hash = previous_hash
-        self.hash = self.calculate_hash()
+# Configuration Constants
+NETWORK = Network.TESTNET
+BLOCKFROST_API_KEY = os.environ.get("BLOCKFROST_API_KEY", "YOUR_BLOCKFROST_PREPROD_KEY")
+METADATA_LABEL = 1999
 
-    def calculate_hash(self):
-        block_string = json.dumps({
-            "index": self.index,
-            "timestamp": self.timestamp,
-            "data": self.data,
-            "previous_hash": self.previous_hash
-        }, sort_keys=True).encode()
-        return hashlib.sha256(block_string).hexdigest()
+# Cryptographic Keys Loading / Generation
+KEY_FILE = "payment.skey"
+VKEY_FILE = "payment.vkey"
 
-class Blockchain:
-    def __init__(self):
-        self.chain = [self.create_genesis_block()]
+if not os.path.exists(KEY_FILE):
+    print("Generating new admin cryptographic keys...")
+    payment_skey = PaymentSigningKey.generate()
+    payment_skey.save(KEY_FILE)
+    payment_vkey = PaymentVerificationKey.from_signing_key(payment_skey)
+    payment_vkey.save(VKEY_FILE)
+    print(f"Keys successfully generated: {KEY_FILE}, {VKEY_FILE}")
+else:
+    payment_skey = PaymentSigningKey.load(KEY_FILE)
+    payment_vkey = PaymentVerificationKey.from_signing_key(payment_skey)
 
-    def create_genesis_block(self):
-        return Block(0, time.time(), "Genesis Block - Election Started", "0")
+my_address = Address(payment_vkey.hash(), network=NETWORK)
 
-    def get_latest_block(self):
-        return self.chain[-1]
+print("=" * 60)
+print(f"BlockVote Cardano Admin Wallet Address: {my_address}")
+print("Funding Link: https://docs.cardano.org/cardano-testnet/faucet")
+print("=" * 60)
 
-    def add_block(self, data):
-        latest_block = self.get_latest_block()
-        new_block = Block(
-            index=latest_block.index + 1,
-            timestamp=time.time(),
-            data=data,
-            previous_hash=latest_block.hash
-        )
-        self.chain.append(new_block)
+# API and Context Initialization (gracefully handle missing API key)
+has_api_key = BLOCKFROST_API_KEY and BLOCKFROST_API_KEY != "YOUR_BLOCKFROST_PREPROD_KEY"
 
-    def is_chain_valid(self):
-        for i in range(1, len(self.chain)):
-            current = self.chain[i]
-            previous = self.chain[i-1]
-            if current.hash != current.calculate_hash():
-                return False
-            if current.previous_hash != previous.hash:
-                return False
-        return True
+if has_api_key:
+    api = BlockFrostApi(project_id=BLOCKFROST_API_KEY, base_url=ApiUrls.preprod.value)
+    context = BlockFrostChainContext(BLOCKFROST_API_KEY, base_url=ApiUrls.preprod.value)
+else:
+    api = None
+    context = None
+    print("WARNING: BLOCKFROST_API_KEY is not configured. Running in Read-Only Demo mode.")
 
-# Initialize our election blockchain
-election = Blockchain()
-
-# --- WEB ROUTES ---
 @app.route('/')
 def home():
-    # Count the votes from the blockchain
     tally = {"Candidate A": 0, "Candidate B": 0}
-    for block in election.chain[1:]:  # Skip genesis block
-        candidate = block.data.get("candidate")
-        if candidate in tally:
-            tally[candidate] += 1
-            
-    is_valid = election.is_chain_valid()
-    return render_template('index.html', chain=election.chain, tally=tally, is_valid=is_valid)
+    transactions = []
+    ledger_error = None
+
+    if has_api_key:
+        try:
+            # Fetch live records directly from Cardano's public ledger state
+            on_chain_records = api.metadata_label_jsons(label=METADATA_LABEL)
+            for record in on_chain_records:
+                vote_data = record.json_metadata
+                if isinstance(vote_data, dict):
+                    candidate = vote_data.get("candidate")
+                    if candidate in tally:
+                        tally[candidate] += 1
+                    transactions.append({
+                        "tx_hash": record.tx_hash,
+                        "data": vote_data
+                    })
+        except Exception as e:
+            ledger_error = f"Ledger Query Error: {e}"
+            print(ledger_error)
+    else:
+        ledger_error = "Blockfrost API key is missing. Please set BLOCKFROST_API_KEY to fetch/cast votes."
+
+    return render_template(
+        'index.html',
+        tally=tally,
+        transactions=transactions,
+        address=str(my_address),
+        has_api_key=has_api_key,
+        ledger_error=ledger_error
+    )
 
 @app.route('/vote', methods=['POST'])
 def vote():
+    if not has_api_key:
+        flash("Cannot cast vote: Blockfrost API key is not configured.", "error")
+        return redirect(url_for('home'))
+
     candidate = request.form.get('candidate')
     if candidate:
-        # Cast vote by adding a new block to the chain
-        election.add_block({"candidate": candidate, "voter_id": f"VOTER_{int(time.time())}"})
-    return redirect(url_for('home'))
-
-@app.route('/tamper', methods=['POST'])
-def tamper():
-    # Simulate a database hack by altering an existing block's data directly
-    if len(election.chain) > 1:
-        election.chain[1].data = {"candidate": "Candidate B", "voter_id": "HACKED_VOTE"}
+        try:
+            # Construct and sign on-chain transaction
+            builder = TransactionBuilder(context)
+            builder.add_input_address(my_address)
+            builder.add_output(TransactionOutput(my_address, 1500000)) # 1.5 ADA self-transfer
+            
+            # Attach vote payload as Cardano Transaction Metadata
+            metadata = Metadata({METADATA_LABEL: {"candidate": candidate, "app": "BlockVote"}})
+            builder.auxiliary_data = AuxiliaryData(metadata=metadata)
+            
+            # Sign and build transaction
+            signed_tx = builder.build_and_sign([payment_skey], change_address=my_address)
+            
+            # Submit transaction
+            context.submit_tx(signed_tx)
+            flash(f"Vote cast successfully! Transaction submitted: {signed_tx.id}", "success")
+            print(f"Transaction Submitted: {signed_tx.id}")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Transaction Execution Error: {error_msg}")
+            if "ValueNotConservedUTxO" in error_msg or "Insufficient UTxO" in error_msg or "UTxO" in error_msg:
+                flash("Transaction failed: Insufficient UTxO balance. Please fund your wallet using the Preprod testnet faucet.", "error")
+            else:
+                flash(f"Transaction Execution Error: {error_msg}", "error")
+                
     return redirect(url_for('home'))
 
 if __name__ == '__main__':
